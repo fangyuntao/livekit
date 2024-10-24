@@ -1222,7 +1222,7 @@ func (r *Room) onTrackPublished(participant types.LocalParticipant, track types.
 			}()
 		}
 	}
-	if r.internal != nil && r.internal.TrackEgress != nil {
+	if participant.Kind() != livekit.ParticipantInfo_EGRESS && r.internal != nil && r.internal.TrackEgress != nil {
 		go func() {
 			if err := StartTrackEgress(
 				context.Background(),
@@ -1728,9 +1728,7 @@ func (r *Room) createAgentDispatchesFromRoomAgent() {
 	roomDisp := r.internal.AgentDispatches
 	if len(roomDisp) == 0 {
 		// Backward compatibility: by default, start any agent in the empty JobName
-		roomDisp = []*livekit.RoomAgentDispatch{
-			&livekit.RoomAgentDispatch{},
-		}
+		roomDisp = []*livekit.RoomAgentDispatch{{}}
 	}
 
 	for _, ag := range roomDisp {
@@ -1818,8 +1816,8 @@ func connectionDetailsFields(infos []*types.ICEConnectionInfo) []interface{} {
 		candidates := make([]string, 0, len(info.Remote)+len(info.Local))
 		for _, c := range info.Local {
 			cStr := "[local]"
-			if c.Selected {
-				cStr += "[selected]"
+			if c.SelectedOrder != 0 {
+				cStr += fmt.Sprintf("[selected:%d]", c.SelectedOrder)
 			} else if c.Filtered {
 				cStr += "[filtered]"
 			}
@@ -1831,8 +1829,8 @@ func connectionDetailsFields(infos []*types.ICEConnectionInfo) []interface{} {
 		}
 		for _, c := range info.Remote {
 			cStr := "[remote]"
-			if c.Selected {
-				cStr += "[selected]"
+			if c.SelectedOrder != 0 {
+				cStr += fmt.Sprintf("[selected:%d]", c.SelectedOrder)
 			} else if c.Filtered {
 				cStr += "[filtered]"
 			}

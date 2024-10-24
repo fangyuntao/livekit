@@ -178,6 +178,8 @@ type PCTransport struct {
 
 	firstOfferReceived      bool
 	firstOfferNoDataChannel bool
+	remoteICEIsLite         *bool
+	localICEIsLite          *bool
 	reliableDC              *webrtc.DataChannel
 	reliableDCOpened        bool
 	lossyDC                 *webrtc.DataChannel
@@ -291,7 +293,11 @@ func newPeerConnection(params TransportParams, onBandwidthEstimator func(estimat
 	//
 	se.DisableSRTPReplayProtection(true)
 	se.DisableSRTCPReplayProtection(true)
-	if !params.ProtocolVersion.SupportsICELite() {
+	if !params.ProtocolVersion.SupportsICELite() || !params.ClientInfo.SupportPrflxOverRelay() {
+		// if client don't support prflx over relay which is only Firefox, disable ICE Lite to ensure that
+		// dropping remote ICE candidates does not get enabled. Firefox does aggressive nomination and
+		// dropping remote ICE candidates means server would accept all switches and it could end up with
+		// the lower priority candidate. As Firefox does not support migration, ICE Lite can be disabled.
 		se.SetLite(false)
 	}
 	se.SetDTLSRetransmissionInterval(dtlsRetransmissionInterval)
@@ -471,8 +477,12 @@ func (t *PCTransport) createPeerConnection() error {
 	t.pc.SCTP().Transport().ICETransport().OnSelectedCandidatePairChange(func(pair *webrtc.ICECandidatePair) {
 		t.params.Logger.Debugw("selected ICE candidate pair changed", "pair", wrappedICECandidatePairLogger{pair})
 		t.connectionDetails.SetSelectedPair(pair)
-		if t.selectedPair.Load() != nil {
-			t.params.Logger.Infow("ice reconnected or switched pair", "pair", wrappedICECandidatePairLogger{pair})
+		existingPair := t.selectedPair.Load()
+		if existingPair != nil {
+			t.params.Logger.Infow(
+				"ice reconnected or switched pair",
+				"existingPair", wrappedICECandidatePairLogger{existingPair},
+				"newPair", wrappedICECandidatePairLogger{pair})
 		}
 		t.selectedPair.Store(pair)
 	})
@@ -1401,7 +1411,7 @@ func (t *PCTransport) handleRemoteICECandidate(e event) error {
 	c := e.data.(*webrtc.ICECandidateInit)
 
 	filtered := false
-	if t.params.DropRemoteICECandidates || (t.preferTCP.Load() && !strings.Contains(c.Candidate, "tcp")) {
+	if t.preferTCP.Load() && !strings.Contains(c.Candidate, "tcp") {
 		t.params.Logger.Debugw("filtering out remote candidate", "candidate", c.Candidate)
 		filtered = true
 	}
@@ -1411,13 +1421,19 @@ func (t *PCTransport) handleRemoteICECandidate(e event) error {
 		filtered = true
 	}
 
-	t.connectionDetails.AddRemoteCandidate(*c, filtered, true)
+	t.connectionDetails.AddRemoteCandidate(*c, filtered, true, false)
 	if filtered {
 		return nil
 	}
 
 	if t.pc.RemoteDescription() == nil {
 		t.pendingRemoteCandidates = append(t.pendingRemoteCandidates, c)
+		return nil
+	}
+
+	if t.params.DropRemoteICECandidates {
+		t.params.Logger.Debugw("dropping remote ICE candidate", "candidate", c.Candidate)
+		t.connectionDetails.AddRemoteCandidate(*c, true, true, true)
 		return nil
 	}
 
@@ -1445,6 +1461,25 @@ func (t *PCTransport) filterCandidates(sd webrtc.SessionDescription, preferTCP, 
 		return sd
 	}
 
+	_, iceLite := parsed.Attribute("ice-lite")
+	var liteSet bool
+	if isLocal {
+		if t.localICEIsLite == nil {
+			t.localICEIsLite = &iceLite
+			liteSet = true
+		}
+	} else {
+		if t.remoteICEIsLite == nil {
+			t.remoteICEIsLite = &iceLite
+			liteSet = true
+		}
+	}
+	if liteSet && t.localICEIsLite != nil && t.remoteICEIsLite != nil {
+		// only drop remote candidates if local is lite and remote is not
+		t.params.DropRemoteICECandidates = t.params.DropRemoteICECandidates && (*t.localICEIsLite && !*t.remoteICEIsLite)
+		t.params.Logger.Debugw("setting DropRemoteICECandidates", "dropRemoteCandidate", t.params.DropRemoteICECandidates, "localICELite", *t.localICEIsLite, "remoteICELite", *t.remoteICEIsLite)
+	}
+
 	filterAttributes := func(attrs []sdp.Attribute) []sdp.Attribute {
 		filteredAttrs := make([]sdp.Attribute, 0, len(attrs))
 		for _, a := range attrs {
@@ -1468,7 +1503,7 @@ func (t *PCTransport) filterCandidates(sd webrtc.SessionDescription, preferTCP, 
 				if isLocal {
 					t.connectionDetails.AddLocalICECandidate(c, excluded, false)
 				} else {
-					t.connectionDetails.AddRemoteICECandidate(c, excluded, false)
+					t.connectionDetails.AddRemoteICECandidate(c, excluded, false, false)
 				}
 			} else {
 				filteredAttrs = append(filteredAttrs, a)
@@ -1673,6 +1708,10 @@ func (t *PCTransport) setRemoteDescription(sd webrtc.SessionDescription) error {
 	}
 
 	for _, c := range t.pendingRemoteCandidates {
+		if t.params.DropRemoteICECandidates {
+			t.connectionDetails.AddRemoteCandidate(*c, true, true, true)
+			continue
+		}
 		if err := t.pc.AddICECandidate(*c); err != nil {
 			t.params.Logger.Warnw("failed to add cached ICE candidate", err, "candidate", c)
 			return errors.Wrap(err, "add ice candidate failed")
